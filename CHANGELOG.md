@@ -33,6 +33,7 @@ Con `docker compose up -d` vengono ricreati `mariadb`, `wordpress` e `db-backup`
 - WordPress: `DISABLE_WP_CRON` (false), da attivare dopo il cron sulla VPS.
 - Hardening: `APACHE_BLOCK_UPLOADS_PHP` (false), `APACHE_BLOCK_XMLRPC` (false).
 - Backup: `BACKUP_TIMEZONE` (Etc/GMT).
+- CPU: `WP_CPU_LIMIT`, `MARIADB_CPU_LIMIT` (0 = nessun limite, come prima).
 
 ### Altro
 

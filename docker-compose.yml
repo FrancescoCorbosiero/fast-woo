@@ -107,6 +107,8 @@ services:
     deploy:
       resources:
         limits:
+          # Core massimi utilizzabili (0 = nessun limite)
+          cpus: ${MARIADB_CPU_LIMIT:-0}
           memory: ${MARIADB_MEMORY_LIMIT:-512M}
         reservations:
           memory: ${MARIADB_MEMORY_RESERVATION:-256M}
@@ -231,6 +233,9 @@ services:
     deploy:
       resources:
         limits:
+          # Core massimi utilizzabili (0 = nessun limite). Su una VPS condivisa
+          # impedisce a uno store in picco di rallentare gli altri siti.
+          cpus: ${WP_CPU_LIMIT:-0}
           memory: ${WP_MEMORY_LIMIT_CONTAINER:-1G}
         reservations:
           memory: ${WP_MEMORY_RESERVATION:-512M}

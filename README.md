@@ -155,6 +155,37 @@ Da validare con la misura sopra: con 30+ plugin un processo pesa tipicamente 60-
 | Grande, poco traffico | 4 vCPU / 16 GB | 2G / 12 | 6G / 4G | 1gb |
 | Grande, molto traffico | 16 vCPU / 32 GB | 6G / 32-48 | 16G / 12G | 2gb |
 
+### Più store sulla stessa VPS
+
+I limiti di memoria e CPU sono tetti per singolo store: la somma dei tetti di memoria
+deve lasciare spazio a sistema, Caddy e altri siti. I tetti di CPU (`WP_CPU_LIMIT`,
+`MARIADB_CPU_LIMIT`) impediscono a uno store in picco di rallentare tutto il resto;
+la loro somma può superare i core disponibili, perché raramente i picchi coincidono.
+
+Esempio: 3 store su una VPS da 16 core / 64 GB con altri siti statici
+(circa 9,5 GB per store, ~29 GB in totale; ogni store usa al massimo 5+3 core):
+
+```
+WP_MEMORY_LIMIT_CONTAINER=4G
+WP_MEMORY_RESERVATION=1G
+WP_CPU_LIMIT=5
+APACHE_MAX_WORKERS=16
+MARIADB_MEMORY_LIMIT=5G
+MARIADB_MEMORY_RESERVATION=1G
+MARIADB_CPU_LIMIT=3
+MARIADB_BUFFER_POOL=3G
+MARIADB_LOG_FILE_SIZE=512M
+MARIADB_IO_CAPACITY=1000
+REDIS_MAXMEMORY=384mb
+REDIS_MEMORY_LIMIT=576M
+```
+
+`MARIADB_BUFFER_POOL=3G` va bene per database fino a ~2 GB. Peso del database:
+
+```bash
+docker compose exec mariadb sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N -e "SELECT CONCAT(ROUND(SUM(data_length+index_length)/1024/1024), \" MB\") FROM information_schema.tables WHERE table_schema=\"$MARIADB_DATABASE\""'
+```
+
 Regole: buffer pool ~50-60% di `MARIADB_MEMORY_LIMIT` sotto i 2 GB, ~70-75% sopra;
 `REDIS_MEMORY_LIMIT` ~1,5 x `REDIS_MAXMEMORY`. Tutte le variabili sono descritte in
 `.env.example`.
