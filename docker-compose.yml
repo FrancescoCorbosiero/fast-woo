@@ -4,12 +4,16 @@
 # Architettura:
 # - Caddy Docker Proxy ESTERNO (label-based routing, SSL automatico)
 # - MariaDB 11.4-lts (LTS fino 2029) con slow query log + tuning
-# - WordPress 6-php8.3-apache con Redis object cache
+# - WordPress 7-php8.3-apache con Redis object cache
 # - Redis 7-alpine per object caching (sessioni, transients, fragments)
 # - DB Backup automatici (mysqldump giornalieri, retention configurabile)
 # - Log rotation su tutti i container (no disk fill)
 # - Resource limits e healthchecks
 # - Named volumes con PROJECT_NAME prefix
+#
+# Tutti i parametri sono in .env (vedi .env.example). Ogni variabile ha un
+# default: un .env di una versione precedente continua a funzionare.
+# Aggiornamento e dimensionamento: vedi README.md
 #
 # PREREQUISITO: Caddy Docker Proxy già configurato sul VPS
 # Vedi: docs/CADDY_PROXY_SETUP.md
@@ -70,14 +74,26 @@ services:
       MARIADB_USER: ${DB_USER}
       MARIADB_PASSWORD: ${DB_PASSWORD}
       MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      # Esegue mariadb-upgrade automaticamente quando l'immagine 11.4.x
+      # viene aggiornata a una patch release successiva
+      MARIADB_AUTO_UPGRADE: "1"
     # Parametri ottimizzati per WooCommerce
-    # innodb_buffer_pool_size: 60-70% della RAM dedicata a MariaDB
+    # innodb_buffer_pool_size: ~50-60% di MARIADB_MEMORY_LIMIT sotto i 2G, ~70-75% sopra
+    # aria/key buffer: WooCommerce usa InnoDB, i default da 128M l'uno erano memoria sprecata
     # slow_query_log: utile per diagnosticare query lente Woo
     command:
       - --max_allowed_packet=256M
       - --innodb_buffer_pool_size=${MARIADB_BUFFER_POOL:-384M}
-      - --innodb_log_file_size=64M
-      - --innodb_flush_log_at_trx_commit=2
+      - --innodb_log_file_size=${MARIADB_LOG_FILE_SIZE:-64M}
+      # 1 = nessuna transazione persa se il server va giù (più sicuro per gli ordini)
+      # 2 = scritture più veloci, si può perdere ~1s di transazioni in caso di crash dell'host
+      - --innodb_flush_log_at_trx_commit=${MARIADB_FLUSH_LOG_AT_TRX_COMMIT:-2}
+      - --innodb_io_capacity=${MARIADB_IO_CAPACITY:-200}
+      - --max_connections=${MARIADB_MAX_CONNECTIONS:-151}
+      - --tmp_table_size=${MARIADB_TMP_TABLE_SIZE:-16M}
+      - --max_heap_table_size=${MARIADB_TMP_TABLE_SIZE:-16M}
+      - --aria_pagecache_buffer_size=${MARIADB_ARIA_PAGECACHE:-32M}
+      - --key_buffer_size=${MARIADB_KEY_BUFFER:-16M}
       - --wait_timeout=28800
       - --interactive_timeout=28800
       - --character-set-server=utf8mb4
@@ -91,6 +107,8 @@ services:
     deploy:
       resources:
         limits:
+          # Core massimi utilizzabili (0 = nessun limite)
+          cpus: ${MARIADB_CPU_LIMIT:-0}
           memory: ${MARIADB_MEMORY_LIMIT:-512M}
         reservations:
           memory: ${MARIADB_MEMORY_RESERVATION:-256M}
@@ -122,6 +140,7 @@ services:
       - redis-data:/data
     # maxmemory + LRU eviction: Redis non cresce mai oltre il limite
     # appendonly no: per object cache la persistenza non serve (riempie da DB)
+    # REDIS_MEMORY_LIMIT: tenerlo ~1.5x REDIS_MAXMEMORY (frammentazione)
     command:
       - redis-server
       - --maxmemory
@@ -151,8 +170,11 @@ services:
   # ============================================
   # WORDPRESS - Applicazione principale
   # ============================================
-  # WordPress 6 con PHP 8.3 (supporto fino 2027)
+  # WordPress 7 con PHP 8.3 (supporto di sicurezza fino a fine 2027)
   # Attende che MariaDB E Redis siano healthy prima di avviarsi
+  #
+  # NOTA: il tag dell'immagine sceglie PHP/Apache. Il core di WordPress vive nel
+  # volume e si aggiorna da WordPress: cambiare il tag NON aggiorna un sito esistente.
   wordpress:
     image: wordpress:7-php8.3-apache
     container_name: ${PROJECT_NAME}-wordpress
@@ -166,37 +188,65 @@ services:
       - wordpress-data:/var/www/html
       - ./uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
       - ./opcache.ini:/usr/local/etc/php/conf.d/zz-opcache.ini:ro
+      - ./apache/mpm_prefork.conf:/etc/apache2/mods-available/mpm_prefork.conf:ro
+      - ./apache/zz-fastwoo.conf:/etc/apache2/conf-enabled/zz-fastwoo.conf:ro
     environment:
       WORDPRESS_DB_HOST: mariadb
       WORDPRESS_DB_NAME: ${DB_NAME}
       WORDPRESS_DB_USER: ${DB_USER}
       WORDPRESS_DB_PASSWORD: ${DB_PASSWORD}
       WORDPRESS_TABLE_PREFIX: ${TABLE_PREFIX:-wp_}
+      # PHP (letti da uploads.ini / opcache.ini)
+      PHP_MEMORY_LIMIT: ${PHP_MEMORY_LIMIT:-512M}
+      PHP_MAX_EXECUTION_TIME: ${PHP_MAX_EXECUTION_TIME:-600}
+      PHP_MAX_INPUT_VARS: ${PHP_MAX_INPUT_VARS:-5000}
+      PHP_OPCACHE_MEMORY: ${PHP_OPCACHE_MEMORY:-256}
+      # Apache (letti da apache/*.conf)
+      # APACHE_MAX_WORKERS: processi PHP contemporanei. Vedi README per il calcolo.
+      APACHE_MAX_WORKERS: ${APACHE_MAX_WORKERS:-10}
+      APACHE_MAX_CONN_PER_CHILD: ${APACHE_MAX_CONN_PER_CHILD:-1000}
+      APACHE_BLOCK_UPLOADS_PHP: ${APACHE_BLOCK_UPLOADS_PHP:-false}
+      APACHE_BLOCK_XMLRPC: ${APACHE_BLOCK_XMLRPC:-false}
       # Configurazione extra wp-config.php
-      # NOTA: questo blocco viene scritto in wp-config.php SOLO al primo boot.
-      # Se modifichi qui dopo, devi anche editare wp-config.php manualmente
-      # o eliminarlo (i dati DB restano) e far rigenerare il file.
+      # Il wp-config.php generato dall'immagine legge questo blocco a OGNI richiesta:
+      # dopo una modifica al .env basta `docker compose up -d`.
+      # (Vale finché wp-config.php è quello generato dall'immagine, verificabile con:
+      #  docker compose exec wordpress grep -c getenv_docker wp-config.php  -> deve essere > 0)
+      # defined() || define(): nessun warning se la costante è già definita altrove.
+      # Valori booleani in .env: solo true/false.
       WORDPRESS_CONFIG_EXTRA: |
-        define('WP_MEMORY_LIMIT', '${WP_MEMORY_LIMIT:-256M}');
-        define('WP_MAX_MEMORY_LIMIT', '${WP_MAX_MEMORY_LIMIT:-384M}');
-        define('FS_METHOD', 'direct');
-        define('DISALLOW_FILE_EDIT', ${DISALLOW_FILE_EDIT:-false});
-        define('WP_REDIS_HOST', 'redis');
-        define('WP_REDIS_PORT', 6379);
-        define('WP_REDIS_TIMEOUT', 1);
-        define('WP_REDIS_READ_TIMEOUT', 1);
-        define('WP_REDIS_DATABASE', 0);
-        define('WP_CACHE_KEY_SALT', '${DOMAIN}_');
-        define('WP_CACHE', true);
+        defined('WP_MEMORY_LIMIT') || define('WP_MEMORY_LIMIT', '${WP_MEMORY_LIMIT:-256M}');
+        defined('WP_MAX_MEMORY_LIMIT') || define('WP_MAX_MEMORY_LIMIT', '${WP_MAX_MEMORY_LIMIT:-384M}');
+        defined('FS_METHOD') || define('FS_METHOD', 'direct');
+        defined('DISALLOW_FILE_EDIT') || define('DISALLOW_FILE_EDIT', ${DISALLOW_FILE_EDIT:-false});
+        defined('DISABLE_WP_CRON') || define('DISABLE_WP_CRON', ${DISABLE_WP_CRON:-false});
+        defined('WP_REDIS_HOST') || define('WP_REDIS_HOST', 'redis');
+        defined('WP_REDIS_PORT') || define('WP_REDIS_PORT', 6379);
+        defined('WP_REDIS_TIMEOUT') || define('WP_REDIS_TIMEOUT', 1);
+        defined('WP_REDIS_READ_TIMEOUT') || define('WP_REDIS_READ_TIMEOUT', 1);
+        defined('WP_REDIS_DATABASE') || define('WP_REDIS_DATABASE', 0);
+        defined('WP_CACHE_KEY_SALT') || define('WP_CACHE_KEY_SALT', '${DOMAIN}_');
+        defined('WP_CACHE') || define('WP_CACHE', true);
     networks:
       - internal
       - caddy
     deploy:
       resources:
         limits:
+          # Core massimi utilizzabili (0 = nessun limite). Su una VPS condivisa
+          # impedisce a uno store in picco di rallentare gli altri siti.
+          cpus: ${WP_CPU_LIMIT:-0}
           memory: ${WP_MEMORY_LIMIT_CONTAINER:-1G}
         reservations:
           memory: ${WP_MEMORY_RESERVATION:-512M}
+    # Verifica che Apache risponda (un file statico: non dipende da plugin
+    # che nascondono wp-login.php o da modalità manutenzione)
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "--max-time", "10", "http://127.0.0.1/wp-includes/images/blank.gif"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
     # Labels per Caddy Docker Proxy (SSL automatico)
     labels:
       caddy: ${DOMAIN}, www.${DOMAIN}
@@ -211,17 +261,24 @@ services:
   # ============================================
   # DB BACKUP - mysqldump automatici
   # ============================================
-  # tiredofit/db-backup: container leggero che esegue mysqldump schedulati
-  # - Backup giornalieri compressi (gzip) in /backups
+  # tiredofit/db-backup v4.1.100 (pinnato per digest)
+  # - Backup giornalieri compressi (gzip) in /backup
   # - Retention configurabile (default 14 giorni)
-  # - Compatibile con MariaDB/MySQL
+  # - Il volume dei backup va incluso nel backup della VPS: il dump deve
+  #   girare PRIMA della finestra di backup della VPS (BACKUP_SCHEDULE + BACKUP_TIMEZONE)
   #
-  # RIPRISTINO MANUALE:
-  #   docker compose exec mariadb sh -c 'mariadb -u root -p${DB_ROOT_PASSWORD} ${DB_NAME}' < backup.sql
+  # NOTA: l'immagine è fuori manutenzione dal 12/03/2026 (successore: nfrastack/db-backup).
+  # Il digest pinnato funziona; NON usare il tag :latest, che oggi non esegue backup.
   #
-  # ACCESSO BACKUP:
-  #   docker run --rm -v ${PROJECT_NAME}-backups-data:/data alpine ls /data
-  #   docker cp ${PROJECT_NAME}-db-backup:/backups ./local-backups
+  # BACKUP MANUALE:
+  #   docker compose exec db-backup backup01-now
+  #
+  # ELENCO BACKUP:
+  #   docker compose exec db-backup ls -la /backup
+  #
+  # RIPRISTINO (dalla cartella del progetto):
+  #   docker compose cp db-backup:/backup/<file>.sql.gz .
+  #   gunzip -c <file>.sql.gz | docker compose exec -T mariadb sh -c 'exec mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" "$MARIADB_DATABASE"'
   db-backup:
     image: tiredofit/db-backup@sha256:761d8613c2c5921ea71f91408eadfe2ad43294c0731abc5b5e0cfc241696e08a
     container_name: ${PROJECT_NAME}-db-backup
@@ -232,21 +289,23 @@ services:
     volumes:
       - backups-data:/backup
     environment:
-      # Tipo DB
-      DB_TYPE: mariadb
-      DB_HOST: mariadb
-      DB_PORT: 3306
-      DB_NAME: ${DB_NAME}
-      DB_USER: root
-      DB_PASS: ${DB_ROOT_PASSWORD}
-      # Schedulazione: ogni notte alle 03:00
+      # Fuso orario della schedulazione (default UTC, come nelle versioni precedenti)
+      TIMEZONE: ${BACKUP_TIMEZONE:-Etc/GMT}
+      # Database
+      DB01_TYPE: mariadb
+      DB01_HOST: mariadb
+      DB01_PORT: 3306
+      DB01_NAME: ${DB_NAME}
+      DB01_USER: root
+      DB01_PASS: ${DB_ROOT_PASSWORD}
+      # Schedulazione: ogni notte alle 03:00 (nel fuso BACKUP_TIMEZONE)
       # Sintassi cron a 5 campi: min ora giorno mese giorno_settimana
-      DB_DUMP_BEGIN: ${BACKUP_SCHEDULE:-0 3 * * *}
-      # Quanti giorni tenere i dump
-      DB_CLEANUP_TIME: ${BACKUP_RETENTION_MINUTES:-20160}  # 14 giorni = 60*24*14
+      DEFAULT_BACKUP_BEGIN: ${BACKUP_SCHEDULE:-0 3 * * *}
+      # Per quanti minuti tenere i dump
+      DEFAULT_CLEANUP_TIME: ${BACKUP_RETENTION_MINUTES:-20160}  # 14 giorni = 60*24*14
       # Compressione
-      COMPRESSION: GZ
-      COMPRESSION_LEVEL: 6
+      DEFAULT_COMPRESSION: GZ
+      DEFAULT_COMPRESSION_LEVEL: 6
       # Container metadata per logging
       CONTAINER_ENABLE_MONITORING: "FALSE"
       CONTAINER_LOG_LEVEL: NOTICE
